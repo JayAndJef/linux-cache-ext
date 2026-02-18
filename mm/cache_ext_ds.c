@@ -2,7 +2,6 @@
  * BPF-Exposed data structures for cache_ext.
  */
 
-#include "slab.h"
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
