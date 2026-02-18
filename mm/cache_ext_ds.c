@@ -2,6 +2,7 @@
  * BPF-Exposed data structures for cache_ext.
  */
 
+#include "slab.h"
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
@@ -162,6 +163,7 @@ enum cache_ext_iter_callback_ret {
 	CACHE_EXT_CONTINUE_ITER = 0,
 	CACHE_EXT_STOP_ITER = 1,
 	CACHE_EXT_EVICT_NODE = 2,
+	CACHE_EXT_SKIP_NODE = 3,
 };
 
 enum cache_ext_iter_ret {
@@ -201,6 +203,10 @@ int cache_ext_list_iterate(struct mem_cgroup *memcg,
 		} else if (cb_ret == CACHE_EXT_STOP_ITER) {
 			ret = CACHE_EXT_DONE_ITER;
 			break;
+		} else if (cb_ret == CACHE_EXT_SKIP_NODE) {
+			// In the simple iterate function, SKIP_NODE behaves like CONTINUE_ITER
+			// since we don't have options to move nodes to different lists
+			continue;
 		} else if (cb_ret == CACHE_EXT_EVICT_NODE) {
 			ctx->folios_to_evict[ctx->nr_folios_to_evict] = node->folio;
 			ctx->nr_folios_to_evict++;
@@ -239,9 +245,14 @@ struct cache_ext_iterate_opts {
 	u64 evict_list;
 	u64 evict_mode;
 
+	// Options for CACHE_EXT_SKIP_NODE nodes
+	u64 skip_list;
+	u64 skip_mode;
+
 	// Output
 	u64 nr_folios_continue;
 	u64 nr_folios_evict;
+	u64 nr_folios_skip;
 };
 
 static bool cache_ext_validate_iterate_opts(struct cache_ext_iterate_opts *opts)
@@ -252,12 +263,19 @@ static bool cache_ext_validate_iterate_opts(struct cache_ext_iterate_opts *opts)
 	if (opts->evict_mode >= CACHE_EXT_ITERATE_MAX)
 		return false;
 
+	if (opts->skip_mode >= CACHE_EXT_ITERATE_MAX)
+		return false;
+
 	if (opts->continue_list != CACHE_EXT_ITERATE_SELF &&
 	    opts->continue_mode == CACHE_EXT_ITERATE_SKIP)
 		return false;
 
 	if (opts->evict_list != CACHE_EXT_ITERATE_SELF &&
 	    opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+		return false;
+
+	if (opts->skip_list != CACHE_EXT_ITERATE_SELF &&
+	    opts->skip_mode == CACHE_EXT_ITERATE_SKIP)
 		return false;
 	return true;
 }
@@ -271,7 +289,7 @@ int cache_ext_list_iterate_extended(struct mem_cgroup *memcg,
 	uint64_t max_iter = 4096;
 	struct cache_ext_list_node *node, *node2;
 	bpf_callback_t bpf_iter_fn = (bpf_callback_t)iter_fn;
-	struct cache_ext_list *continue_list, *evict_list;
+	struct cache_ext_list *continue_list, *evict_list, *skip_list;
 
 	if (!cache_ext_validate_iterate_opts(opts))
 		return -1;
@@ -298,7 +316,15 @@ int cache_ext_list_iterate_extended(struct mem_cgroup *memcg,
 		evict_list = list;
 	}
 
-	if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP)
+	if (opts->skip_list != CACHE_EXT_ITERATE_SELF) {
+		skip_list = cache_ext_ds_registry_get(registry, opts->skip_list);
+		if (!skip_list)
+			return -1;
+	} else {
+		skip_list = list;
+	}
+
+	if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP && opts->skip_mode == CACHE_EXT_ITERATE_SKIP)
 		read_lock(&registry->lock);
 	else
 		write_lock(&registry->lock);
@@ -326,6 +352,15 @@ int cache_ext_list_iterate_extended(struct mem_cgroup *memcg,
 		} else if (cb_ret == CACHE_EXT_STOP_ITER) {
 			ret = CACHE_EXT_DONE_ITER;
 			break;
+		} else if (cb_ret == CACHE_EXT_SKIP_NODE) {
+			if (opts->skip_mode == CACHE_EXT_ITERATE_HEAD)
+				list_move(&node->node, &skip_list->head);
+			else if (opts->skip_mode == CACHE_EXT_ITERATE_TAIL)
+				list_move_tail(&node->node, &skip_list->head);
+
+			opts->nr_folios_skip++;
+
+			continue;
 		} else if (cb_ret == CACHE_EXT_EVICT_NODE) {
 			ctx->folios_to_evict[ctx->nr_folios_to_evict] = node->folio;
 			ctx->nr_folios_to_evict++;
@@ -347,7 +382,7 @@ int cache_ext_list_iterate_extended(struct mem_cgroup *memcg,
 		}
 	}
 
-	if (opts->continue_mode == CACHE_EXT_CONTINUE_ITER && opts->evict_mode == CACHE_EXT_CONTINUE_ITER)
+	if (opts->continue_mode == CACHE_EXT_ITERATE_SKIP && opts->evict_mode == CACHE_EXT_ITERATE_SKIP && opts->skip_mode == CACHE_EXT_ITERATE_SKIP)
 		read_unlock(&registry->lock);
 	else
 		write_unlock(&registry->lock);
