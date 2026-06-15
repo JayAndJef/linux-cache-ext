@@ -11,8 +11,6 @@
 #include <linux/cache_ext.h>
 #include <linux/btf.h>
 #include <linux/sort.h>
-#include <linux/mm.h>		/* folio_try_get / folio_put */
-#include <linux/rcupdate.h>	/* rcu_read_lock / kfree_rcu */
 
 /******************************************************************************
  * Linked List ****************************************************************
@@ -55,10 +53,8 @@ struct cache_ext_list_node *cache_ext_list_node_alloc(struct folio *folio)
 
 void cache_ext_list_node_free(struct cache_ext_list_node *node)
 {
-	// Defer the free a grace period so the sampler can score snipped nodes
-	// without holding registry->lock: it reads node->folio (and the list_del
-	// poison) under rcu_read_lock, which outlasts any concurrent free here.
-	kfree_rcu(node, rcu);
+	// TODO: Verify it's isolated first.
+	kfree(node);
 }
 
 int __cache_ext_list_add_impl(struct cache_ext_list *list, struct folio *folio,
@@ -476,34 +472,10 @@ __bpf_kfunc int bpf_cache_ext_list_iterate_extended(
 
 #define MAX_SAMPLE_FOLIOS 2048
 DEFINE_PER_CPU(struct cache_ext_list_node *, sample_folios[MAX_SAMPLE_FOLIOS]);
-/* Per-snipped-folio pin flag, parallel to sample_folios valid only with preempt disabled. */
-DEFINE_PER_CPU(bool, sample_pinned[MAX_SAMPLE_FOLIOS]);
 
-/* Hash lookup WITHOUT taking registry->lock -- caller must already hold it
- * (read or write). */
-static struct cache_ext_list *
-__cache_ext_ds_registry_get_locked(struct cache_ext_ds_registry *registry,
-				   u64 list_ptr)
-{
-	struct cache_ext_list *cur_list;
-	u64 key = list_ptr;
-
-	hash_for_each_possible(registry->ds_hash, cur_list, h_node, key) {
-		if (key == (u64)cur_list)
-			return cur_list;
-	}
-	return NULL;
-}
-
-void __putback_list_nodes(struct cache_ext_list *list,
-			  struct cache_ext_list_node **sample_folios_arr,
-			  const bool *pinned, int size)
+void __putback_list_nodes(struct cache_ext_list *list, struct cache_ext_list_node** sample_folios_arr, int size)
 {
 	for (int i = 0; i < size; i++) {
-		// Unpinned: folio_try_get failed at snip (folio mid-removal). Leave
-		// the node for its freer (valid_folios_del -> kfree_rcu); do not re-add.
-		if (!pinned[i])
-			continue;
 		// HACK: Check if either left or right pointer is poisoned
 		if (sample_folios_arr[i]->node.next == LIST_POISON1 ||
 			sample_folios_arr[i]->node.next == LIST_POISON2 ||
@@ -525,93 +497,77 @@ int __bpf_cache_ext_list_sample(struct mem_cgroup *memcg, u64 list,
 	// sample_size elements in the given list.
 	int sample_size = opts->sample_size;
 	int num_folios_to_sample = ctx->request_nr_folios_to_evict * sample_size;
-	int sample_folios_size = 0;
-	int sample_folios_idx = 0;
-	int ret = -1;
-	struct cache_ext_list_node **sample_folios_arr;
-	bool *sample_pinned_arr;
-	struct cache_ext_ds_registry *registry;
-	struct cache_ext_list *list_ptr;
-
-	ctx->nr_folios_to_evict = 0;
 	if (num_folios_to_sample > MAX_SAMPLE_FOLIOS) {
 		pr_warn("cache_ext: num_folios_to_sample is too large\n");
 		return -1;
 	}
-	sample_folios_arr = this_cpu_ptr(sample_folios);
-	sample_pinned_arr = this_cpu_ptr(sample_pinned);
-	registry = cache_ext_ds_registry_from_memcg(memcg);
+	int sample_folios_size = 0;
+	struct cache_ext_list_node **sample_folios_arr = this_cpu_ptr(sample_folios);
 
-	// snip the front of the list and pin each folio
-	write_lock(&registry->lock);
-	list_ptr = __cache_ext_ds_registry_get_locked(registry, list);
+	struct cache_ext_ds_registry *registry = cache_ext_ds_registry_from_memcg(memcg);
+	struct cache_ext_list *list_ptr = cache_ext_ds_registry_get(registry, list);
 	if (!list_ptr) {
-		write_unlock(&registry->lock);
 		pr_err("cache_ext: list is NULL\n");
 		return -1;
 	}
-	for (int i = 0; i < num_folios_to_sample; i++) {
-		struct cache_ext_list_node *node;
+	write_lock(&registry->lock);
 
-		if (list_empty(&list_ptr->head))
-			break;	// fewer than requested available; bail after putback
-		node = list_first_entry(&list_ptr->head,
-					struct cache_ext_list_node, node);
-		list_del_init(&node->node);
+	// Optimization: Snip the front of the list and select the pages without
+	// holding the lock.
+	for (int i = 0; i < num_folios_to_sample; i++) {
+		if (list_empty(&list_ptr->head)) {
+			pr_warn("cache_ext: ran out of folios to sample\n");
+			__putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
+			write_unlock(&registry->lock);
+			return -1;
+		}
+		struct cache_ext_list_node *node = list_first_entry(
+			&list_ptr->head, struct cache_ext_list_node, node);
 		sample_folios_arr[i] = node;
-		sample_pinned_arr[i] = folio_try_get(node->folio);
 		sample_folios_size++;
+		// if (node->node.next == NULL || node->node.prev == NULL) {
+		// 	pr_warn("cache_ext: node->node.next or node->node.prev is NULL\n");
+		// }
+		list_del_init(&node->node);
 	}
-	// Must stay before write_unlock.
-	rcu_read_lock();
+
 	write_unlock(&registry->lock);
 
-	if (sample_folios_size < num_folios_to_sample) {
-		// Ran out mid-snip: don't score a partial grouping, just put back.
-		pr_warn("cache_ext: ran out of folios to sample\n");
-		goto putback;
-	}
-
-	// score lock-free. Nodes stay valid via RCU (kfree_rcu defers),
-	// folios via the pin. Unpinned (dying) folios score S64_MAX so they never
-	// win a group
+	// 1. For every n elements, evict the one with the min score
+	ctx->nr_folios_to_evict = 0;
+	int sample_folios_idx = 0;
 	for (int i = 0; i < ctx->request_nr_folios_to_evict; i++) {
 		struct cache_ext_list_node *min_node = sample_folios_arr[sample_folios_idx];
-		s64 min_score = sample_pinned_arr[sample_folios_idx] ?
-				score_fn(min_node) : S64_MAX;
+		s64 min_score = score_fn(min_node);
+
 		sample_folios_idx++;
+
+		// if (!min_node) {
+		// 	pr_warn("cache_ext: min_node is NULL, ran out of folios to evict\n");
+		// 	break;
+		// }
 
 		for (int j = 1; j < sample_size; j++) {
 			struct cache_ext_list_node *curr_node = sample_folios_arr[sample_folios_idx];
-			s64 curr_score = sample_pinned_arr[sample_folios_idx] ?
-					 score_fn(curr_node) : S64_MAX;
+			s64 curr_score = score_fn(curr_node);
 			sample_folios_idx++;
 			if (curr_score < min_score) {
 				min_score = curr_score;
 				min_node = curr_node;
 			}
 		}
+		// min_node must be non-NULL here
 		ctx->folios_to_evict[ctx->nr_folios_to_evict] = min_node->folio;
 		ctx->scores[ctx->nr_folios_to_evict] = min_score;
 		ctx->nr_folios_to_evict++;
 	}
-	ret = 0;
 
-putback:
-	// Drop the pins taken at snip
-	for (int i = 0; i < sample_folios_size; i++)
-		if (sample_pinned_arr[i])
-			folio_put(sample_folios_arr[i]->folio);
-
+	// 2. Put everything to the back of the list.
 	write_lock(&registry->lock);
-	list_ptr = __cache_ext_ds_registry_get_locked(registry, list);
-	if (list_ptr)
-		__putback_list_nodes(list_ptr, sample_folios_arr,
-				     sample_pinned_arr, sample_folios_size);
+	__putback_list_nodes(list_ptr, sample_folios_arr, sample_folios_size);
 	write_unlock(&registry->lock);
-	rcu_read_unlock();
 
-	return ret;
+	return 0;
 }
 
 __bpf_kfunc int
@@ -713,12 +669,17 @@ struct cache_ext_list *
 cache_ext_ds_registry_get(struct cache_ext_ds_registry *registry, u64 list_ptr)
 {
 	struct cache_ext_list *cur_list;
-
+	u64 key = list_ptr;
 	read_lock(&registry->lock);
-	cur_list = __cache_ext_ds_registry_get_locked(registry, list_ptr);
+	hash_for_each_possible(registry->ds_hash, cur_list, h_node, key) {
+		if (key == (u64)cur_list) {
+			read_unlock(&registry->lock);
+			return cur_list;
+		}
+	}
 	read_unlock(&registry->lock);
 
-	return cur_list;
+	return NULL;
 }
 
 struct cache_ext_ds_registry *

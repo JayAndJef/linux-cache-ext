@@ -42,13 +42,6 @@ struct cache_ext_list_node {
 	struct folio *folio;
 
 	struct list_head node;
-
-	/*
-	 * Kept separate from @node (never union with it): the list_del poison on
-	 * @node must survive into the RCU grace period so the sampler's putback
-	 * poison-check can detect a node freed while it was isolated for scoring.
-	 */
-	struct rcu_head rcu;
 };
 
 /*
